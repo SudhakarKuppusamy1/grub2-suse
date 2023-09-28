@@ -1,6 +1,6 @@
 /*
  *  GRUB  --  GRand Unified Bootloader
- *  Copyright (C) 2020-2021  IBM Corporation.
+ *  Copyright (C) 2020, 2021, 2022, 2023  IBM Corporation.
  *
  *  GRUB is free software: you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License as published by
@@ -36,6 +36,10 @@
 
 #include <grub/platform_keystore.h>
 #include "appendedsig.h"
+
+#define SHA256_LEN 32
+#define SHA384_LEN 48
+#define SHA512_LEN 64
 
 GRUB_MOD_LICENSE ("GPLv3+");
 
@@ -517,20 +521,94 @@ extract_appended_signature (const grub_uint8_t *buf, grub_size_t bufsize,
 }
 
 static grub_err_t
+grub_get_binary_hash (const grub_size_t binary_hash_size, const grub_uint8_t *data,
+                      const grub_size_t data_size, grub_uint8_t *hash, grub_size_t *hash_size)
+{
+  grub_uuid_t guid = { 0 };
+
+  /* support SHA256, SHA384 and SHA512 for binary hash */
+  if (binary_hash_size == SHA256_LEN)
+    grub_memcpy (&guid, &GRUB_PKS_CERT_SHA256_GUID, GRUB_UUID_SIZE);
+  else if (binary_hash_size == SHA384_LEN)
+    grub_memcpy (&guid, &GRUB_PKS_CERT_SHA384_GUID, GRUB_UUID_SIZE);
+  else if (binary_hash_size == SHA512_LEN)
+    grub_memcpy (&guid, &GRUB_PKS_CERT_SHA512_GUID, GRUB_UUID_SIZE);
+  else
+    {
+      grub_dprintf ("appendedsig", "unsupported hash type (%d) and skipping binary hash\n",
+                    binary_hash_size);
+      return GRUB_ERR_UNKNOWN_COMMAND;
+    }
+
+  return grub_get_hash (&guid, data, data_size, hash, hash_size);
+}
+
+/*
+ * verify binary hash against the list of binary hashes that are distrusted
+ * and trusted.
+ */
+static grub_err_t
+grub_verify_binary_hash (const grub_uint8_t *data, const grub_size_t data_size)
+{
+  grub_err_t rc = GRUB_ERR_NONE;
+  grub_size_t i = 0, hash_size = 0;
+  grub_uint8_t hash[GRUB_MAX_HASH_SIZE] = { 0 };
+
+  for (i = 0; i < grub_dbx.signature_entries; i++)
+    {
+      rc = grub_get_binary_hash (grub_dbx.signature_size[i], data, data_size,
+                                 hash, &hash_size);
+      if (rc != GRUB_ERR_NONE)
+        continue;
+
+      if (hash_size == grub_dbx.signature_size[i] &&
+          grub_memcmp (grub_dbx.signatures[i], hash, hash_size) == 0)
+        {
+          grub_dprintf ("appendedsig", "the binary hash (%02x%02x%02x%02x) was listed "
+                        "as distrusted\n", hash[0], hash[1], hash[2], hash[3]);
+          return GRUB_ERR_BAD_SIGNATURE;
+        }
+    }
+
+  for (i = 0; i < grub_db.signature_entries; i++)
+    {
+      rc = grub_get_binary_hash (grub_db.signature_size[i], data, data_size,
+                                 hash, &hash_size);
+      if (rc != GRUB_ERR_NONE)
+        continue;
+
+      if (hash_size == grub_db.signature_size[i] &&
+          grub_memcmp (grub_db.signatures[i], hash, hash_size) == 0)
+        {
+          grub_dprintf ("appendedsig", "verified with a trusted binary hash "
+                        "(%02x%02x%02x%02x)\n", hash[0], hash[1], hash[2], hash[3]);
+          return GRUB_ERR_NONE;
+        }
+    }
+
+  return GRUB_ERR_EOF;
+}
+
+/*
+ * verify the kernel's integrity, the trusted key will be used from
+ * the trusted key list. If it fails, verify it against the list of binary hashes
+ * that are distrusted and trusted.
+ */
+static grub_err_t
 grub_verify_appended_signature (const grub_uint8_t *buf, grub_size_t bufsize)
 {
   grub_err_t err = GRUB_ERR_NONE;
-  grub_size_t datasize;
+  grub_size_t datasize = 0;
   void *context;
   unsigned char *hash;
   gcry_mpi_t hashmpi;
   gcry_err_code_t rc;
-  struct x509_certificate *pk;
+  struct x509_certificate *cert = NULL;
   struct grub_appended_signature sig;
   struct pkcs7_signerInfo *si;
-  int i;
+  int i = 0;
 
-  if (!grub_db.key_entries)
+  if (!grub_db.key_entries && !grub_db.signature_entries)
     return grub_error (GRUB_ERR_BAD_SIGNATURE,
 		       N_("No trusted keys to verify against"));
 
@@ -539,72 +617,70 @@ grub_verify_appended_signature (const grub_uint8_t *buf, grub_size_t bufsize)
     return err;
 
   datasize = bufsize - sig.signature_len;
-
-  for (i = 0; i < sig.pkcs7.signerInfo_count; i++)
+  err = grub_verify_binary_hash (buf, datasize);
+  if (err == GRUB_ERR_EOF)
     {
-      /* This could be optimised in a couple of ways:
-	  - we could only compute hashes once per hash type
-	  - we could track signer information and only verify where IDs match
-	 For now we do the naive O(trusted keys * pkcs7 signers) approach.
-	*/
-      si = &sig.pkcs7.signerInfos[i];
-      context = grub_zalloc (si->hash->contextsize);
-      if (!context)
-	return grub_errno;
-    
-      si->hash->init (context);
-      si->hash->write (context, buf, datasize);
-      si->hash->final (context);
-      hash = si->hash->read (context);
+      for (i = 0; i < sig.pkcs7.signerInfo_count; i++)
+        {
+          /*
+           * This could be optimised in a couple of ways:
+           * - we could only compute hashes once per hash type
+           * - we could track signer information and only verify where IDs match
+           * For now we do the naive O(trusted keys * pkcs7 signers) approach.
+           */
+          si = &sig.pkcs7.signerInfos[i];
+          context = grub_zalloc (si->hash->contextsize);
+          if (context == NULL)
+            return grub_errno;
 
-      grub_dprintf ("appendedsig",
-		    "data size %" PRIxGRUB_SIZE ", signer %d hash %02x%02x%02x%02x...\n",
-		    datasize, i, hash[0], hash[1], hash[2], hash[3]);
-    
-      err = GRUB_ERR_BAD_SIGNATURE;
-      for (pk = grub_db.keys; pk; pk = pk->next)
-	{
-	  rc = grub_crypto_rsa_pad (&hashmpi, hash, si->hash, pk->mpis[0]);
-	  if (rc)
-	    {
-	      err = grub_error (GRUB_ERR_BAD_SIGNATURE,
-    				N_("Error padding hash for RSA verification: %d"),
-    				rc);
-	      grub_free (context);
-	      goto cleanup;
-	    }
+          si->hash->init (context);
+          si->hash->write (context, buf, datasize);
+          si->hash->final (context);
+          hash = si->hash->read (context);
 
-	  rc = _gcry_pubkey_spec_rsa.verify (0, hashmpi, &si->sig_mpi,
-					     pk->mpis, NULL, NULL);
-	  gcry_mpi_release (hashmpi);
+          grub_dprintf ("appendedsig",
+                        "data size %" PRIxGRUB_SIZE ", signer %d hash %02x%02x%02x%02x...\n",
+                        datasize, i, hash[0], hash[1], hash[2], hash[3]);
 
-	  if (rc == 0)
-	    {
-	      grub_dprintf ("appendedsig",
-			    "verify signer %d with key '%s' succeeded\n", i,
-			    pk->subject);
-	      err = GRUB_ERR_NONE;
-	      break;
-	    }
+          err = GRUB_ERR_BAD_SIGNATURE;
+          for (cert = grub_db.keys; cert; cert = cert->next)
+            {
+              rc = grub_crypto_rsa_pad (&hashmpi, hash, si->hash, cert->mpis[0]);
+              if (rc != 0)
+                {
+                  err = grub_error (GRUB_ERR_BAD_SIGNATURE,
+                                    N_("Error padding hash for RSA verification: %d"), rc);
+                  grub_free (context);
+                  pkcs7_signedData_release (&sig.pkcs7);
+                  return err;
+                }
 
-	  grub_dprintf ("appendedsig",
-			"verify signer %d with key '%s' failed with %d\n", i,
-			pk->subject, rc);
-	}
+              rc = _gcry_pubkey_spec_rsa.verify (0, hashmpi, &si->sig_mpi, cert->mpis, NULL, NULL);
+              gcry_mpi_release (hashmpi);
+              if (rc == 0)
+                {
+                  grub_dprintf ("appendedsig", "verify signer %d with key '%s' succeeded\n",
+                                i, cert->subject);
+                  err = GRUB_ERR_NONE;
+                  break;
+                }
 
-      grub_free (context);
+              grub_dprintf ("appendedsig", "verify signer %d with key '%s' failed with %d\n",
+                            i, cert->subject, rc);
+            }
 
-      if (err == GRUB_ERR_NONE)
-	break;
+          grub_free (context);
+          if (err == GRUB_ERR_NONE)
+            break;
+      }
     }
 
-  /* If we didn't verify, provide a neat message */
-  if (err != GRUB_ERR_NONE)
-    err = grub_error (GRUB_ERR_BAD_SIGNATURE,
-		      N_("Failed to verify signature against a trusted key"));
-
-cleanup:
   pkcs7_signedData_release (&sig.pkcs7);
+
+  if (err != GRUB_ERR_NONE)
+    err = grub_error (err, N_("failed to verify signature with any trusted key\n"));
+  else
+    grub_printf ("appendedsig: successfully verified the signature with a trusted key\n");
 
   return err;
 }
