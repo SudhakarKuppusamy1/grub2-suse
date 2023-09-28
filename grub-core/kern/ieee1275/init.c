@@ -47,6 +47,7 @@
 #include <grub/machine/kernel.h>
 #endif
 #include <grub/lockdown.h>
+#include <grub/platform_keystore.h>
 
 /* The maximum heap size we're going to claim at boot. Not used by sparc. */
 #ifdef __i386__
@@ -854,14 +855,15 @@ grub_get_ieee1275_secure_boot (void)
 {
   grub_ieee1275_phandle_t root;
   int rc;
-  grub_uint32_t is_sb;
+  grub_uint32_t is_sb = 0;
 
   grub_ieee1275_finddevice ("/", &root);
 
   rc = grub_ieee1275_get_integer_property (root, "ibm,secure-boot", &is_sb,
                                            sizeof (is_sb), 0);
 
-  /* ibm,secure-boot:
+  /*
+   * ibm,secure-boot:
    * 0 - disabled
    * 1 - audit
    * 2 - enforce
@@ -870,7 +872,16 @@ grub_get_ieee1275_secure_boot (void)
    * We only support enforce.
    */
   if (rc >= 0 && is_sb >= 2)
-    grub_lockdown ();
+    {
+      grub_printf ("secure boot enabled\n");
+      rc = grub_platform_keystore_init ();
+      if (rc != GRUB_ERR_NONE)
+        grub_printf ("Warning: initialization of the platform keystore failed!\n");
+
+      grub_lockdown ();
+    }
+  else
+    grub_printf ("secure boot disabled\n");
 }
 
 grub_addr_t grub_modbase;
